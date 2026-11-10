@@ -1,0 +1,36 @@
+{
+  "name": "inventory-manager",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Desktop inventory and sales manager built with Tauri, Rust and React",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "app": "tauri dev",
+    "app:build": "tauri build"
+  },
+  "dependencies": {
+    "@fontsource-variable/inter": "^5.3.0",
+    "@tanstack/react-query": "^5.107.1",
+    "@tauri-apps/api": "^2.12.4",
+    "lucide-react": "^1.71.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-router-dom": "^7.18.5",
+    "recharts": "^3.10.1",
+    "sonner": "^2.0.8"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.5",
+    "@tauri-apps/cli": "^2.12.4",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "tailwindcss": "^4.3.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.7"
+  }
+}
