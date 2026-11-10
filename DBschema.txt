@@ -1,0 +1,362 @@
+// =====================================================================
+// Inventory_Manager — Superette / Épicerie Edition (Algeria)
+// Database: SQLite (local, offline-first)
+// Conventions:
+//   - All money is stored as INTEGER in centimes (1 DA = 100 centimes)
+//     to avoid floating-point errors.
+//   - Quantities that can be weighed (kg) use decimal(12,3).
+//   - Records created on the phone (offline) use UUID primary keys so
+//     they can be synced to the PC without ID collisions.
+//   - Confirmed sales are IMMUTABLE: corrections are made through
+//     return entries or stock/ledger entries, never UPDATE/DELETE.
+// =====================================================================
+
+// ---------------------------------------------------------------------
+// ENUMS
+// ---------------------------------------------------------------------
+
+Enum user_role {
+  owner
+  manager
+  cashier
+  stock_worker
+}
+
+Enum unit_type {
+  unit
+  weight        // sold by kg / g
+}
+
+Enum movement_type {
+  purchase        // delivery from supplier
+  sale
+  customer_return
+  supplier_return
+  loss            // damaged / stolen
+  expiry          // expired goods removed
+  adjustment      // manual correction or inventory count
+}
+
+Enum sale_type {
+  sale
+  return          // refers to original_sale_id
+}
+
+Enum payment_method {
+  cash
+  cib
+  edahabia
+  baridimob
+  credit          // customer will pay later (crédit)
+}
+
+Enum ledger_entry_type {
+  credit_sale     // customer owes more
+  payment         // customer paid (partially or fully)
+  adjustment
+}
+
+Enum cash_movement_type {
+  cash_in
+  cash_out
+}
+
+Enum price_tier {
+  retail          // détail
+  wholesale       // gros
+}
+
+// ---------------------------------------------------------------------
+// USERS AND DEVICES
+// ---------------------------------------------------------------------
+
+Table users {
+  id integer [pk, increment]
+  full_name varchar [not null]
+  username varchar [unique, not null]
+  password_hash varchar [not null, note: "Argon2 hash, never the plain password"]
+  pin_hash varchar [note: "Optional short PIN for fast cashier login (hashed)"]
+  role user_role [not null]
+  is_active boolean [not null, default: true, note: "Deactivate instead of deleting"]
+  created_at timestamp [not null]
+}
+
+Table devices {
+  id uuid [pk]
+  name varchar [not null, note: "e.g. 'Main PC', 'Phone of Ahmed'"]
+  type varchar [not null, note: "pc | phone"]
+  receipt_prefix varchar [unique, not null, note: "e.g. 'PC', 'P1' — prefix for receipt numbers made on this device"]
+  paired_at timestamp
+  is_active boolean [not null, default: true]
+}
+
+Table shop_settings {
+  id integer [pk, note: "Single row (id = 1)"]
+  shop_name varchar [not null]
+  address varchar
+  phone varchar
+  rc varchar [note: "Registre de commerce"]
+  nif varchar [note: "Numéro d'identification fiscale"]
+  nis varchar [note: "Numéro d'identification statistique"]
+  ai varchar [note: "Article d'imposition"]
+  vat_enabled boolean [not null, default: false, note: "Many small shops do not charge VAT — verify with an accountant"]
+  stamp_duty_enabled boolean [not null, default: false, note: "Droit de timbre on cash invoices — verify"]
+  default_language varchar [not null, default: 'fr', note: "ar | fr"]
+  receipt_footer varchar
+  allow_negative_stock boolean [not null, default: false, note: "Owner-level override"]
+}
+
+// ---------------------------------------------------------------------
+// PRODUCT CATALOG
+// ---------------------------------------------------------------------
+
+Table categories {
+  id integer [pk, increment]
+  name_ar varchar
+  name_fr varchar [not null]
+  is_active boolean [not null, default: true]
+}
+
+Table products {
+  id integer [pk, increment]
+  name_ar varchar
+  name_fr varchar [not null]
+  category_id integer [ref: > categories.id]
+  unit_type unit_type [not null, default: 'unit']
+  price_retail integer [not null, note: ">= 0, centimes"]
+  price_wholesale integer [note: ">= 0, centimes, optional"]
+  cost_price integer [not null, default: 0, note: ">= 0, centimes — visible to owner/manager only"]
+  vat_rate decimal(5,2) [not null, default: 0, note: "e.g. 19.00, 9.00, 0.00 — configurable, not hard-coded"]
+  stock_quantity decimal(12,3) [not null, default: 0, note: ">= 0 (unless allow_negative_stock)"]
+  min_stock decimal(12,3) [not null, default: 0, note: ">= 0, alert threshold"]
+  track_expiry boolean [not null, default: false]
+  is_active boolean [not null, default: true, note: "Archive instead of deleting, to keep history"]
+  created_at timestamp [not null]
+  updated_at timestamp [not null]
+}
+
+Table product_barcodes {
+  id integer [pk, increment]
+  product_id integer [not null, ref: > products.id]
+  barcode varchar [unique, not null]
+  units_per_barcode integer [not null, default: 1, note: "> 0 — e.g. 1 for a single unit, 24 for a carton barcode"]
+  label varchar [note: "e.g. 'unit', 'pack of 6', 'carton'"]
+}
+
+// Batches are only used for products with track_expiry = true
+Table stock_batches {
+  id integer [pk, increment]
+  product_id integer [not null, ref: > products.id]
+  quantity_remaining decimal(12,3) [not null, note: ">= 0"]
+  expiry_date date
+  received_at timestamp [not null]
+  purchase_item_id integer [ref: > purchase_items.id, note: "Origin of the batch (nullable for opening stock)"]
+}
+
+// Full traceability: every stock change is recorded here
+Table stock_movements {
+  id uuid [pk]
+  product_id integer [not null, ref: > products.id]
+  type movement_type [not null]
+  quantity decimal(12,3) [not null, note: "Signed: + increases stock, - decreases stock"]
+  reason varchar [note: "Required for loss, expiry, adjustment"]
+  user_id integer [not null, ref: > users.id]
+  device_id uuid [ref: > devices.id]
+  sale_id uuid [ref: > sales.id]
+  purchase_id integer [ref: > purchases.id]
+  created_at timestamp [not null]
+
+  indexes {
+    (product_id, created_at)
+  }
+}
+
+// ---------------------------------------------------------------------
+// SHIFTS (CASH-UP)
+// ---------------------------------------------------------------------
+
+Table shifts {
+  id integer [pk, increment]
+  user_id integer [not null, ref: > users.id]
+  device_id uuid [ref: > devices.id]
+  opened_at timestamp [not null]
+  closed_at timestamp
+  opening_cash integer [not null, default: 0, note: "centimes"]
+  expected_cash integer [note: "Computed at closing"]
+  counted_cash integer [note: "Entered by the cashier at closing"]
+  difference integer [note: "counted_cash - expected_cash"]
+}
+
+Table cash_movements {
+  id integer [pk, increment]
+  shift_id integer [not null, ref: > shifts.id]
+  type cash_movement_type [not null]
+  amount integer [not null, note: "> 0, centimes"]
+  reason varchar [not null, note: "e.g. paid delivery driver"]
+  created_at timestamp [not null]
+}
+
+// ---------------------------------------------------------------------
+// CUSTOMERS AND CREDIT BOOK (CRÉDIT)
+// ---------------------------------------------------------------------
+
+Table customers {
+  id integer [pk, increment]
+  name varchar [not null]
+  phone varchar
+  credit_limit integer [note: "centimes, null = no limit"]
+  is_active boolean [not null, default: true]
+  created_at timestamp [not null]
+}
+
+// Balance = sum of entries (credit_sale = +, payment = -). Never edited.
+Table customer_ledger {
+  id uuid [pk]
+  customer_id integer [not null, ref: > customers.id]
+  type ledger_entry_type [not null]
+  amount integer [not null, note: "Signed, centimes: + customer owes more, - customer paid"]
+  sale_id uuid [ref: > sales.id]
+  payment_method payment_method [note: "Method used when type = payment"]
+  user_id integer [not null, ref: > users.id]
+  note varchar
+  created_at timestamp [not null]
+
+  indexes {
+    (customer_id, created_at)
+  }
+}
+
+// ---------------------------------------------------------------------
+// SALES
+// ---------------------------------------------------------------------
+
+Table sales {
+  id uuid [pk, note: "UUID so phone sales sync without collisions"]
+  type sale_type [not null, default: 'sale']
+  original_sale_id uuid [ref: > sales.id, note: "Set when type = return"]
+  receipt_number varchar [unique, not null, note: "device prefix + sequence, e.g. PC-000123 — no gaps per device"]
+  device_id uuid [not null, ref: > devices.id]
+  device_seq integer [not null, note: "Sequential counter per device"]
+  user_id integer [not null, ref: > users.id, note: "Cashier"]
+  shift_id integer [ref: > shifts.id]
+  customer_id integer [ref: > customers.id, note: "Required if part of the payment is credit"]
+  price_tier price_tier [not null, default: 'retail']
+  subtotal integer [not null, note: "centimes"]
+  discount integer [not null, default: 0, note: "centimes, permission-controlled"]
+  vat_total integer [not null, default: 0, note: "centimes"]
+  stamp_duty integer [not null, default: 0, note: "centimes"]
+  total integer [not null, note: ">= 0, centimes"]
+  created_offline boolean [not null, default: false, note: "True if created on the phone in power-cut mode"]
+  created_at timestamp [not null]
+  synced_at timestamp
+
+  indexes {
+    (device_id, device_seq) [unique]
+    created_at
+  }
+}
+
+Table sale_items {
+  id uuid [pk]
+  sale_id uuid [not null, ref: > sales.id]
+  product_id integer [not null, ref: > products.id]
+  quantity decimal(12,3) [not null, note: "> 0"]
+  unit_price integer [not null, note: "centimes — snapshot of the price at sale time"]
+  unit_cost integer [not null, note: "centimes — snapshot of the cost at sale time, used for profit"]
+  vat_rate decimal(5,2) [not null, default: 0]
+  line_total integer [not null, note: "centimes"]
+}
+
+Table payments {
+  id uuid [pk]
+  sale_id uuid [not null, ref: > sales.id]
+  method payment_method [not null]
+  amount integer [not null, note: "> 0, centimes — a sale can be split across several methods"]
+  cash_given integer [note: "centimes, for cash payments (to compute change)"]
+  created_at timestamp [not null]
+}
+
+// ---------------------------------------------------------------------
+// SUPPLIERS AND PURCHASES
+// ---------------------------------------------------------------------
+
+Table suppliers {
+  id integer [pk, increment]
+  name varchar [not null]
+  phone varchar
+  is_active boolean [not null, default: true]
+}
+
+Table purchases {
+  id integer [pk, increment]
+  supplier_id integer [not null, ref: > suppliers.id]
+  user_id integer [not null, ref: > users.id]
+  reference varchar [note: "Supplier invoice / delivery note number"]
+  total integer [not null, note: ">= 0, centimes"]
+  paid_amount integer [not null, default: 0, note: "centimes paid at delivery"]
+  created_at timestamp [not null]
+}
+
+Table purchase_items {
+  id integer [pk, increment]
+  purchase_id integer [not null, ref: > purchases.id]
+  product_id integer [not null, ref: > products.id]
+  quantity decimal(12,3) [not null, note: "> 0"]
+  unit_cost integer [not null, note: ">= 0, centimes"]
+  expiry_date date [note: "For products with track_expiry"]
+}
+
+// What the owner owes suppliers (purchases = +, payments = -)
+Table supplier_ledger {
+  id uuid [pk]
+  supplier_id integer [not null, ref: > suppliers.id]
+  purchase_id integer [ref: > purchases.id]
+  amount integer [not null, note: "Signed, centimes: + owner owes more, - owner paid"]
+  note varchar
+  user_id integer [not null, ref: > users.id]
+  created_at timestamp [not null]
+}
+
+// ---------------------------------------------------------------------
+// AUDIT, SYNC AND LICENSE
+// ---------------------------------------------------------------------
+
+Table audit_log {
+  id integer [pk, increment]
+  user_id integer [ref: > users.id]
+  device_id uuid [ref: > devices.id]
+  action varchar [not null, note: "e.g. price_change, discount, sale_return, stock_adjustment, user_created, login_failed"]
+  entity varchar [not null, note: "Table name"]
+  entity_id varchar
+  old_value text [note: "JSON"]
+  new_value text [note: "JSON"]
+  created_at timestamp [not null]
+
+  indexes {
+    (entity, entity_id)
+    created_at
+  }
+}
+
+Table sync_log {
+  id integer [pk, increment]
+  device_id uuid [not null, ref: > devices.id]
+  started_at timestamp [not null]
+  finished_at timestamp
+  records_received integer [default: 0]
+  records_sent integer [default: 0]
+  conflicts_flagged integer [default: 0, note: "e.g. stock went negative after sync — owner must review"]
+  status varchar [note: "ok | partial | failed"]
+}
+
+Table license {
+  id integer [pk, note: "Single row (id = 1)"]
+  license_id varchar [not null]
+  license_code text [not null, note: "Signed code (Ed25519) provided by the vendor"]
+  machine_fingerprint varchar [not null]
+  plan varchar [note: "basic | standard | pro"]
+  max_devices integer [not null, default: 1]
+  issued_at date [not null]
+  expires_at date [not null]
+  last_seen_date date [not null, note: "Used to detect system clock rollback"]
+}
